@@ -38,7 +38,7 @@ class CortexOS:
 
     def __init__(
         self,
-        db_path: str = "cortexos.db",
+        db_path: Optional[str] = None,
         base_url: Optional[str] = None,
         config: Optional[Config] = None,
         api_key: Optional[str] = None,
@@ -46,14 +46,15 @@ class CortexOS:
         """初始化 CortexOS 客户端。
 
         Args:
-            db_path: SQLite 数据库路径（本地模式）。
+            db_path: SQLite 数据库路径（本地模式）。不传则用
+                config.storage.local.path（默认 ./data/memory.db）。
             base_url: REST API 基础 URL（可选，传入则走 REST 模式）。
             config: 配置（可选，默认 Config()）。
             api_key: AgentKey 明文（REST 模式认证，Bearer 头）。
         """
-        self.db_path = db_path
-        self.base_url = base_url
         self.config = config or Config()
+        self.db_path = db_path or self.config.storage.local.path
+        self.base_url = base_url
         self.api_key = api_key
         self._backend = None
         self._initialized = False

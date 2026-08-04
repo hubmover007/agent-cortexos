@@ -14,13 +14,17 @@ from typing import Optional
 from cortexos.config import _get_or_create_embedder
 
 
-def _get_backend_and_config(path: Optional[str] = None):
-    """初始化后端和配置。"""
+def _get_backend_and_config(path: Optional[str] = None, config_path: Optional[str] = None):
+    """初始化后端和配置。
+
+    优先级：显式 --db > 配置文件 storage.local.path > 默认 cortexos.db。
+    配置从 YAML（--config）或环境变量 CORTEXOS_* 加载。
+    """
     from cortexos.config import Config
     from cortexos.storage.sqlite_backend import SqliteBackend
 
-    db_path = path or "cortexos.db"
-    config = Config()
+    config = Config.load(config_path=config_path)
+    db_path = path or config.storage.local.path
     backend = SqliteBackend(db_path)
     return backend, config
 
@@ -29,12 +33,15 @@ async def cmd_serve(args):
     """启动 API 服务。"""
     import uvicorn
     from cortexos.api import create_app_v1
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
 
     app = create_app_v1(backend, config)
+    # 显式 --host/--port 优先，否则用配置文件 server 段
+    host = args.host if args.host is not None else config.server.host
+    port = args.port if args.port is not None else config.server.port
     config_uv = uvicorn.Config(
-        app, host=args.host, port=args.port,
+        app, host=host, port=port,
         log_level="info",
     )
     server = uvicorn.Server(config_uv)
@@ -44,7 +51,7 @@ async def cmd_serve(args):
 async def cmd_pair_request(args):
     """发起配对请求。"""
     from cortexos.auth.pairing import pair_request
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     result = await pair_request(args.agent_name, backend, config)
     print(json.dumps(result, indent=2))
@@ -53,7 +60,7 @@ async def cmd_pair_request(args):
 async def cmd_pair_approve(args):
     """批准配对。"""
     from cortexos.auth.pairing import pair_approve
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     result = await pair_approve(args.code, json.loads(args.scopes), backend, config)
     if result:
@@ -66,7 +73,7 @@ async def cmd_pair_approve(args):
 async def cmd_pair_exchange(args):
     """兑换密钥。"""
     from cortexos.auth.pairing import pair_exchange
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     result = await pair_exchange(args.code, backend, config)
     if result:
@@ -80,7 +87,7 @@ async def cmd_store(args):
     """存储记忆。"""
     from cortexos.models import Entry
     from cortexos.store import store_entry
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
 
     entry = Entry(
@@ -100,8 +107,7 @@ async def cmd_recall(args):
     """检索记忆。"""
     from cortexos.recall.hybrid import hybrid_retrieve
     from cortexos.recall.graph import GraphIndex
-    from cortexos.zones.engine import compute_gravity
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
 
     from cortexos.embedding import build_embedder
@@ -134,7 +140,7 @@ async def cmd_recall(args):
 
 async def cmd_zones(args):
     """查看 zone 列表。"""
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     zones = await backend.list_zones(scope=args.scope)
     items = [
@@ -146,7 +152,7 @@ async def cmd_zones(args):
 
 async def cmd_stats(args):
     """查看统计。"""
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     stats = await backend.get_stats()
     print(json.dumps(stats, indent=2))
@@ -155,7 +161,7 @@ async def cmd_stats(args):
 async def cmd_consolidate(args):
     """触发整合。"""
     from cortexos.lifecycle.consolidate import ConsolidateEngine
-    backend, config = _get_backend_and_config(args.db)
+    backend, config = _get_backend_and_config(args.db, args.config)
     await backend.initialize()
     engine = ConsolidateEngine(backend, config)
     stats = await engine.consolidate(args.scope)
@@ -172,25 +178,29 @@ def main():
 
     # serve
     p = sub.add_parser("serve", help="启动 API 服务")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # pair request
     p = sub.add_parser("pair-request", help="发起配对请求")
     p.add_argument("agent_name")
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # pair approve
     p = sub.add_parser("pair-approve", help="批准配对")
     p.add_argument("code")
     p.add_argument("--scopes", default='{}')
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # pair exchange
     p = sub.add_parser("pair-exchange", help="兑换密钥")
     p.add_argument("code")
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # store
     p = sub.add_parser("store", help="存储记忆")
@@ -198,28 +208,33 @@ def main():
     p.add_argument("--scope", default="default")
     p.add_argument("--zone", default=None)
     p.add_argument("--entities", default=None)
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # recall
     p = sub.add_parser("recall", help="检索记忆")
     p.add_argument("query")
     p.add_argument("--scope", default="default")
     p.add_argument("--top-k", type=int, default=10)
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # zones
     p = sub.add_parser("zones", help="查看 zone 列表")
     p.add_argument("--scope", default="default")
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # stats
     p = sub.add_parser("stats", help="查看统计")
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     # consolidate
     p = sub.add_parser("consolidate", help="触发整合")
     p.add_argument("--scope", default="default")
-    p.add_argument("--db", default="cortexos.db")
+    p.add_argument("--db", default=None)
+    p.add_argument("--config", default=None, help="配置文件路径（YAML）")
 
     args = parser.parse_args()
     if args.command is None:

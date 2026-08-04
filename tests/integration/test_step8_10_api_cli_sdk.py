@@ -759,3 +759,82 @@ class TestAuthzHardening:
                 "query": q, "scope": "agent:sx", "top_k": 5,
             })
             assert resp.status_code == 200
+
+
+class TestLocalDeployConfigChain:
+    """本地部署配置链路回归：--config / 环境变量 / 默认路径。"""
+
+    def test_cli_uses_config_yaml_db_path(self):
+        """回归：--config 指定 storage.local.path 后，CLI store 写入该路径。"""
+        import subprocess
+        import sys
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(db_path)  # 让 CLI 自己创建
+        config_path = os.path.join(os.path.dirname(db_path), "cfg.yaml")
+        with open(config_path, "w") as f:
+            f.write(f"storage:\n  local:\n    path: {db_path}\n")
+
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", "cortexos", "store",
+                 "yaml 配置路径测试", "--scope", "agent:yaml",
+                 "--config", config_path],
+                capture_output=True, text=True,
+            )
+            assert r.returncode == 0, r.stderr
+            assert os.path.isfile(db_path), "db 应创建在配置指定路径"
+        finally:
+            for p in (db_path, db_path + "-wal", db_path + "-shm", config_path):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_cli_uses_env_db_path(self):
+        """回归：CORTEXOS_STORAGE_LOCAL_PATH 环境变量覆盖 db 路径。"""
+        import subprocess
+        import sys
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(db_path)
+
+        try:
+            env = {**os.environ, "CORTEXOS_STORAGE_LOCAL_PATH": db_path}
+            r = subprocess.run(
+                [sys.executable, "-m", "cortexos", "store",
+                 "env 配置路径测试", "--scope", "agent:env"],
+                capture_output=True, text=True, env=env,
+            )
+            assert r.returncode == 0, r.stderr
+            assert os.path.isfile(db_path), "db 应创建在环境变量指定路径"
+        finally:
+            for p in (db_path, db_path + "-wal", db_path + "-shm"):
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_sdk_default_db_from_config(self):
+        """回归：CortexOS() 不传 db_path 时用 config.storage.local.path。"""
+        import asyncio
+        from cortexos import CortexOS
+        from cortexos.config import Config
+
+        cfg = Config()
+        cx = CortexOS(config=cfg)
+        assert cx.db_path == cfg.storage.local.path
+
+        # 显式传 db_path 优先于配置
+        cx2 = CortexOS(db_path="/tmp/explicit.db", config=cfg)
+        assert cx2.db_path == "/tmp/explicit.db"
+
+    def test_serve_accepts_config_flag(self):
+        """回归：serve 子命令支持 --config（设计文档用法）。"""
+        import subprocess
+        import sys
+
+        r = subprocess.run(
+            [sys.executable, "-m", "cortexos", "serve", "--help"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0
+        assert "--config" in r.stdout
