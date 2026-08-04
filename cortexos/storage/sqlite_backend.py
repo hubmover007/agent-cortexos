@@ -663,7 +663,8 @@ class SqliteBackend:
         await self._execute("""
             INSERT INTO pair_codes (code, agent_id, agent_name, expires_at, status)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(code) DO NOTHING
+            ON CONFLICT(code) DO UPDATE SET
+                status=excluded.status, expires_at=excluded.expires_at
         """, (
             code_data["code"], code_data["agent_id"], code_data["agent_name"],
             code_data["expires_at"], code_data.get("status", "pending")
