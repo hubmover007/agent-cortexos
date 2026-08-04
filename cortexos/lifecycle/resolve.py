@@ -48,11 +48,11 @@ async def resolve_fact(
             continue
 
         if old.object == new_fact.object:
-            # 一致 → 合并
+            # 一致 → 合并：置信度取高；有效期取“更远”（None=永不过期优先）
             old.confidence = max(old.confidence, new_fact.confidence)
-            if old.valid_until is None:
-                pass  # 保持永不过期
-            elif new_fact.valid_until is not None:
+            if new_fact.valid_until is None:
+                old.valid_until = None
+            elif old.valid_until is not None:
                 old.valid_until = max(old.valid_until, new_fact.valid_until)
             new_fact.status = "superseded"
         else:

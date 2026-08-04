@@ -75,8 +75,8 @@ class ConsolidateEngine:
                 raw_entries.append(e)
                 stats["raw_scanned"] += 1
 
-            # ── Consolidate ──
-            if len(raw_entries) >= cfg.raw_summary_threshold:
+            # ── Consolidate（内容门：新增 raw 达到阈值才生成 episode）──
+            if len(raw_entries) >= cfg.content_gate_count:
                 from cortexos.zones.cluster import cluster_entries
                 clusters = cluster_entries(
                     raw_entries, similarity_threshold=cfg.similarity_threshold,
@@ -151,7 +151,11 @@ class ConsolidateEngine:
         self._lock[scope] = False
 
     async def _resolve_scope_facts(self, scope: str) -> None:
-        """处理 scope 内的所有事实冲突。"""
+        """处理 scope 内的所有事实冲突。
+
+        每组 subject+predicate 只消解一次（最新一条作为新事实），
+        被截断/合并修改的旧事实必须写回，否则时间窗口截断不落库。
+        """
         from cortexos.lifecycle.resolve import resolve_fact
         facts = await self._backend.find_facts(scope=scope, status="active")
         # 按 subject+predicate 分组
@@ -160,12 +164,20 @@ class ConsolidateEngine:
             key = (f.subject, f.predicate)
             groups.setdefault(key, []).append(f)
 
-        for key, group in groups.items():
-            if len(group) >= 2:
-                for i, new_f in enumerate(group):
-                    others = [g for j, g in enumerate(group) if j != i]
-                    resolved = await resolve_fact(new_f, others, self._config)
-                    await self._backend.upsert_fact(resolved)
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            # 按生效时间升序：最新一条作为新事实，其余作为旧事实
+            group.sort(key=lambda f: f.valid_from or 0)
+            new_f = group[-1]
+            others = group[:-1]
+            before = {old.id: old.valid_until for old in others}
+            resolved = await resolve_fact(new_f, others, self._config)
+            await self._backend.upsert_fact(resolved)
+            # 写回被截断/合并修改的旧事实
+            for old in others:
+                if old.status != "active" or old.valid_until != before.get(old.id):
+                    await self._backend.upsert_fact(old)
 
     async def _prune_zones(self, scope: str) -> int:
         """归档过期 Zone。"""
@@ -173,7 +185,7 @@ class ConsolidateEngine:
         zones = await self._backend.list_zones(scope=scope)
         changes = await lifecycle_check(zones, self._config)
         for zone_name, new_status in changes:
-            zone = await self._backend.get_zone(zone_name)
+            zone = await self._backend.get_zone(zone_name, scope=scope)
             if zone:
                 zone.status = new_status
                 await self._backend.upsert_zone(zone)

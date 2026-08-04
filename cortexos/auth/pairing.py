@@ -128,8 +128,8 @@ async def pair_approve(
         return None
 
     now = time.time()
-    if now > pair["expires_at"] or pair["status"] != "pending":
-        # 标记过期
+    if now > pair["expires_at"]:
+        # 真正过期才标记 expired
         await backend.upsert_pair_code({
             **pair,
             "status": "expired",
@@ -138,7 +138,22 @@ async def pair_approve(
             "ts": now,
             "agent_id": pair["agent_id"],
             "action": "pair_approve_failed",
-            "detail": f"配对码 {code} 已过期或已使用",
+            "detail": f"配对码 {code} 已过期",
+        })
+        return None
+
+    if pair["status"] != "pending":
+        # 已批准/已使用：不破坏状态（approved 码不能被改为 expired），直接拒绝
+        return None
+
+    # 防呆：scope 权限值必须是 read/write/readwrite
+    allowed = {"read", "write", "readwrite"}
+    if any(v not in allowed for v in scope_permissions.values()):
+        await backend.write_audit_log({
+            "ts": now,
+            "agent_id": pair["agent_id"],
+            "action": "pair_approve_failed",
+            "detail": f"配对码 {code} 权限值非法: {scope_permissions}",
         })
         return None
 

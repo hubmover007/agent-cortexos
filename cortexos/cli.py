@@ -79,7 +79,7 @@ async def cmd_pair_exchange(args):
 async def cmd_store(args):
     """存储记忆。"""
     from cortexos.models import Entry
-    from cortexos.zones.router import route_entry
+    from cortexos.store import store_entry
     backend, config = _get_backend_and_config(args.db)
     await backend.initialize()
 
@@ -90,14 +90,8 @@ async def cmd_store(args):
         entities=json.loads(args.entities) if args.entities else [],
         zone=args.zone if args.zone else "_inbox",
     )
-    await backend.upsert_entry(entry)
-
-    # 自动路由 zone
-    if not args.zone:
-        zones = await backend.list_zones(scope=args.scope)
-        zone_name = await route_entry(entry, zones, _get_or_create_embedder(config), config)
-        entry.zone = zone_name
-        await backend.upsert_entry(entry)
+    # 完整写入管线：实体提取 → embedding → 路由 → 质心更新
+    await store_entry(entry, backend, _get_or_create_embedder(config), config)
 
     print(json.dumps({"id": entry.id, "zone": entry.zone or "_inbox"}, indent=2))
 

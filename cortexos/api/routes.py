@@ -10,9 +10,9 @@ from fastapi import FastAPI, HTTPException, Depends, Query, Request
 from pydantic import BaseModel
 
 from cortexos.api.deps import (
-    get_backend, get_config, get_embedder, verify_bearer, _check_rate_limit,
+    get_backend, get_config, get_embedder, verify_bearer, assert_scope,
 )
-from cortexos.config import Config, _make_embedder
+from cortexos.config import Config
 from cortexos.models import Entry
 from cortexos.storage import StorageBackend
 
@@ -115,10 +115,16 @@ class PinZoneReq(BaseModel):
 
 # ── Helper ──
 
-def _as_entry(item, backend, config) -> Entry:
-    if isinstance(item, Entry):
-        return item
-    return Entry(**item)
+def _has_any_scope_perm(key_data: Dict, scope: str) -> bool:
+    """key 是否对 scope 有任意权限（含 zone 覆盖）。"""
+    from cortexos.auth.permissions import _rank
+    perm = key_data.get("scope_permissions", {}).get(scope)
+    if perm and _rank(perm) > 0:
+        return True
+    for key, ov in (key_data.get("zone_overrides", {}) or {}).items():
+        if key.startswith(f"{scope}:") and _rank(ov) > 0:
+            return True
+    return False
 
 
 # ── Standalone routes ──
@@ -181,7 +187,6 @@ async def list_keys(
 ):
     """列出 Agent 的所有密钥（脱敏）。"""
     from cortexos.auth.keys import list_keys as do_list
-    from cortexos.auth.permissions import _rank
     keys = await do_list(key_data["agent_id"], backend)
     return KeyListResp(keys=keys)
 
@@ -191,8 +196,13 @@ async def delete_key(
     key_data: Dict = Depends(verify_bearer),
     backend=Depends(get_backend),
 ):
-    """吊销密钥。"""
+    """吊销密钥（只能吊销自己的 key，防跨 agent 越权）。"""
     from cortexos.auth.keys import revoke_key
+    key = await backend.get_agent_key_by_id(key_id)
+    if not key:
+        raise HTTPException(404, "Key not found")
+    if key["agent_id"] != key_data["agent_id"]:
+        raise HTTPException(403, "Cannot revoke another agent's key")
     ok = await revoke_key(key_id, backend)
     if not ok:
         raise HTTPException(404, "Key not found")
@@ -206,9 +216,14 @@ async def store_memory(
     backend=Depends(get_backend),
     config=Depends(get_config),
     embedder=Depends(get_embedder),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """写入记忆。"""
-    from cortexos.zones.router import route_entry
+    """写入记忆（需要 scope 写权限）。
+
+    完整写入管线：实体提取 → embedding → 三层 zone 路由 → 质心更新 → facts/edges。
+    """
+    from cortexos.store import store_entry
+    assert_scope(key_data, req.scope, "write")
 
     entry = Entry(
         content=req.content,
@@ -216,17 +231,10 @@ async def store_memory(
         layer=req.layer,
         entities=req.entities,
         metadata=req.metadata,
+        zone=req.zone or "_inbox",
     )
 
-    # 自动路由 zone
-    if req.zone:
-        entry.zone = req.zone
-    else:
-        zones = await backend.list_zones(scope=req.scope)
-        zone_name = await route_entry(entry, zones, _make_embedder(config), config)
-        entry.zone = zone_name
-
-    await backend.upsert_entry(entry)
+    await store_entry(entry, backend, embedder, config)
 
     return MemoryResp(
         id=entry.id, content=entry.content,
@@ -239,11 +247,13 @@ async def store_memory(
 async def get_memory(
     memory_id: str,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """读取单条记忆（仅 active，软删除后返回 404）。"""
+    """读取单条记忆（仅 active；需要该条目 scope 的读权限）。"""
     entry = await backend.get_entry(memory_id)
     if not entry or entry.status != "active":
         raise HTTPException(404, "Memory not found")
+    assert_scope(key_data, entry.scope, "read")
     return MemoryResp(
         id=entry.id, content=entry.content,
         scope=entry.scope, zone=entry.zone or "_inbox",
@@ -255,8 +265,13 @@ async def get_memory(
 async def delete_memory(
     memory_id: str,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """删除记忆。"""
+    """删除记忆（需要该条目 scope 的写权限）。"""
+    entry = await backend.get_entry(memory_id)
+    if not entry or entry.status != "active":
+        raise HTTPException(404, "Memory not found")
+    assert_scope(key_data, entry.scope, "write")
     ok = await backend.delete_entry(memory_id)
     if not ok:
         raise HTTPException(404, "Memory not found")
@@ -268,8 +283,10 @@ async def retrieve_memories(
     backend=Depends(get_backend),
     config=Depends(get_config),
     embedder=Depends(get_embedder),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """四通道混合检索。"""
+    """四通道混合检索（需要 scope 读权限）。"""
+    assert_scope(key_data, req.scope, "read")
     from cortexos.recall.hybrid import hybrid_retrieve
     from cortexos.recall.graph import GraphIndex
 
@@ -309,8 +326,10 @@ async def retrieve_memories(
 async def search_memories(
     req: SearchReq,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """搜索记忆（词法 FTS5）。"""
+    """搜索记忆（词法 FTS5，需要 scope 读权限）。"""
+    assert_scope(key_data, req.scope, "read")
     results = await backend.search_lexical(req.query, scope=req.scope, top_k=req.top_k)
     items = [
         {"id": e.id, "content": e.content,
@@ -326,8 +345,10 @@ async def get_context(
     zone: Optional[str] = None,
     max_tokens: int = 4000,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """获取上下文。"""
+    """获取上下文（需要 scope 读权限）。"""
+    assert_scope(key_data, scope, "read")
     entries = await backend.list_entries(scope=scope, zone=zone, limit=50)
     items = [
         {"id": e.id, "content": e.content, "zone": e.zone or "_inbox",
@@ -345,8 +366,10 @@ async def get_zone_context(
     zone: str,
     limit: int = 20,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """获取 zone 上下文。"""
+    """获取 zone 上下文（需要 scope 读权限）。"""
+    assert_scope(key_data, scope, "read")
     entries = await backend.list_entries(scope=scope, zone=zone, limit=limit)
     items = [
         {"id": e.id, "content": e.content, "layer": e.layer}
@@ -356,17 +379,23 @@ async def get_zone_context(
     return {"context": context, "entries": items}
 
 
-async def list_scopes(backend=Depends(get_backend)):
-    """列出所有活跃 scope。"""
+async def list_scopes(
+    backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
+):
+    """列出当前 key 有权限的活跃 scope。"""
     scopes = await backend.list_scopes()
-    return {"scopes": scopes}
+    allowed = [s for s in scopes if _has_any_scope_perm(key_data, s)]
+    return {"scopes": allowed}
 
 
 async def list_zones(
     scope: str = "default",
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """列出 scope 下所有 zone。"""
+    """列出 scope 下所有 zone（需要 scope 读权限）。"""
+    assert_scope(key_data, scope, "read")
     zones = await backend.list_zones(scope=scope)
     return {
         "zones": [
@@ -384,9 +413,11 @@ async def pin_zone(
     name: str,
     req: PinZoneReq,
     backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """固定 zone。"""
-    zone = await backend.get_zone(name)
+    """固定 zone（需要 scope 写权限）。"""
+    assert_scope(key_data, scope, "write")
+    zone = await backend.get_zone(name, scope=scope)
     if not zone:
         raise HTTPException(404, "Zone not found")
     if req.gravity is not None:
@@ -401,16 +432,21 @@ async def trigger_consolidate(
     scope: str = "default",
     backend=Depends(get_backend),
     config=Depends(get_config),
+    key_data: Dict = Depends(verify_bearer),
 ):
-    """触发整合。"""
+    """触发整合（需要 scope 写权限，防止越权影响他人数据）。"""
+    assert_scope(key_data, scope, "write")
     from cortexos.lifecycle.consolidate import ConsolidateEngine
     engine = ConsolidateEngine(backend, config)
     stats = await engine.consolidate(scope)
     return stats
 
 
-async def get_stats(backend=Depends(get_backend)):
-    """获取统计信息。"""
+async def get_stats(
+    backend=Depends(get_backend),
+    key_data: Dict = Depends(verify_bearer),
+):
+    """获取统计信息（需有效密钥）。"""
     stats = await backend.get_stats()
     return StatsResp(
         total_entries=stats.get("total_entries", 0),

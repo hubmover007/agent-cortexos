@@ -41,17 +41,20 @@ class CortexOS:
         db_path: str = "cortexos.db",
         base_url: Optional[str] = None,
         config: Optional[Config] = None,
+        api_key: Optional[str] = None,
     ):
         """初始化 CortexOS 客户端。
 
         Args:
-            db_path: SQLite 数据库路径。
-            base_url: REST API 基础 URL（可选）。
+            db_path: SQLite 数据库路径（本地模式）。
+            base_url: REST API 基础 URL（可选，传入则走 REST 模式）。
             config: 配置（可选，默认 Config()）。
+            api_key: AgentKey 明文（REST 模式认证，Bearer 头）。
         """
         self.db_path = db_path
         self.base_url = base_url
         self.config = config or Config()
+        self.api_key = api_key
         self._backend = None
         self._initialized = False
 
@@ -104,6 +107,8 @@ class CortexOS:
 
         await self._ensure_init()
 
+        # 完整写入管线：实体提取 → embedding → 路由 → 质心更新 → facts/edges
+        from cortexos.store import store_entry
         entry = Entry(
             content=content,
             scope=scope,
@@ -112,15 +117,7 @@ class CortexOS:
             metadata=metadata or {},
             zone=zone or "_inbox",
         )
-        await self.backend.upsert_entry(entry)
-
-        # 自动路由 zone
-        if not zone:
-            from cortexos.zones.router import route_entry
-            zones = await self.backend.list_zones(scope=scope)
-            assigned = await route_entry(entry, zones, _make_embedder(self.config), self.config)
-            entry.zone = assigned
-            await self.backend.upsert_entry(entry)
+        await store_entry(entry, self.backend, self._embedder, self.config)
 
         return entry.id
 
@@ -195,8 +192,11 @@ class CortexOS:
         if self.base_url:
             return await self._rest_search(query, scope, limit)
         await self._ensure_init()
-        rows = await self.backend.search_lexical(query, scope=scope, limit=limit)
-        return [dict(r) for r in rows]
+        rows = await self.backend.search_lexical(query, scope=scope, top_k=limit)
+        return [
+            {"id": e.id, "content": e.content, "score": round(s, 4), "zone": e.zone}
+            for e, s in rows
+        ]
 
     # ── Zones ──
 
@@ -232,6 +232,13 @@ class CortexOS:
 
     # ── REST 模式 ──
 
+    def _headers(self) -> Dict:
+        """REST 请求头（带 Bearer 认证）。"""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
     async def _rest_store(self, content, scope, layer, entities, metadata, zone):
         import aiohttp
         async with aiohttp.ClientSession() as sess:
@@ -240,6 +247,7 @@ class CortexOS:
                 json={"content": content, "scope": scope, "layer": layer,
                       "entities": entities or [], "metadata": metadata or {},
                       "zone": zone},
+                headers=self._headers(),
             ) as resp:
                 data = await resp.json()
                 return data["id"]
@@ -247,7 +255,9 @@ class CortexOS:
     async def _rest_get(self, entry_id):
         import aiohttp
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"{self.base_url}/memories/{entry_id}") as resp:
+            async with sess.get(
+                f"{self.base_url}/memories/{entry_id}", headers=self._headers(),
+            ) as resp:
                 if resp.status == 404:
                     return None
                 return await resp.json()
@@ -255,7 +265,9 @@ class CortexOS:
     async def _rest_delete(self, entry_id):
         import aiohttp
         async with aiohttp.ClientSession() as sess:
-            async with sess.delete(f"{self.base_url}/memories/{entry_id}") as resp:
+            async with sess.delete(
+                f"{self.base_url}/memories/{entry_id}", headers=self._headers(),
+            ) as resp:
                 return resp.status == 200
 
     async def _rest_recall(self, query, scope, top_k):
@@ -264,6 +276,7 @@ class CortexOS:
             async with sess.post(
                 f"{self.base_url}/retrieve",
                 json={"query": query, "scope": scope, "top_k": top_k},
+                headers=self._headers(),
             ) as resp:
                 data = await resp.json()
                 return data["items"]
@@ -274,6 +287,7 @@ class CortexOS:
             async with sess.post(
                 f"{self.base_url}/search",
                 json={"query": query, "scope": scope, "top_k": limit},
+                headers=self._headers(),
             ) as resp:
                 data = await resp.json()
                 return data["items"]
@@ -281,14 +295,18 @@ class CortexOS:
     async def _rest_zones(self, scope):
         import aiohttp
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"{self.base_url}/zones?scope={scope}") as resp:
+            async with sess.get(
+                f"{self.base_url}/zones?scope={scope}", headers=self._headers(),
+            ) as resp:
                 data = await resp.json()
                 return data["zones"]
 
     async def _rest_stats(self):
         import aiohttp
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"{self.base_url}/stats") as resp:
+            async with sess.get(
+                f"{self.base_url}/stats", headers=self._headers(),
+            ) as resp:
                 return await resp.json()
 
     async def _rest_consolidate(self, scope):
@@ -296,6 +314,7 @@ class CortexOS:
         async with aiohttp.ClientSession() as sess:
             async with sess.post(
                 f"{self.base_url}/consolidate?scope={scope}",
+                headers=self._headers(),
             ) as resp:
                 return await resp.json()
 

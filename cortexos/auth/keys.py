@@ -130,13 +130,21 @@ async def list_keys(agent_id: str, backend: StorageBackend) -> List[Dict]:
         密钥列表（不含 hash）。
     """
     keys = await backend.list_agent_keys(agent_id)
-    # 脱敏：不返回 key_hash
+    # 脱敏：不返回 key_hash，JSON 字段反序列化
+    import json
     result = []
     for k in keys:
+        sp = k["scope_permissions"]
+        if isinstance(sp, str):
+            sp = json.loads(sp)
+        zo = k.get("zone_overrides", {})
+        if isinstance(zo, str):
+            zo = json.loads(zo)
         result.append({
             "key_id": k["key_id"],
             "agent_id": k["agent_id"],
-            "scope_permissions": k["scope_permissions"],
+            "scope_permissions": sp,
+            "zone_overrides": zo,
             "rate_limit": k["rate_limit"],
             "expires_at": k["expires_at"],
             "created_at": k["created_at"],
@@ -176,4 +184,11 @@ async def authenticate(
         "last_used": time.time(),
     })
 
-    return key_data
+    # 解析 JSON 字段（scope_permissions/zone_overrides），供权限判定直接使用
+    from cortexos.models import AgentKey
+    key = AgentKey.from_row(key_data)
+    return {
+        **key_data,
+        "scope_permissions": key.scope_permissions,
+        "zone_overrides": key.zone_overrides,
+    }

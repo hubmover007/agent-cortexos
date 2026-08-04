@@ -128,8 +128,8 @@ class StorageBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def get_zone(self, name: str) -> Optional[Zone]:
-        """读取单个 Zone。"""
+    async def get_zone(self, name: str, scope: Optional[str] = None) -> Optional[Zone]:
+        """读取单个 Zone（复合主键 scope+name）。"""
         ...
 
     @abc.abstractmethod
@@ -207,6 +207,18 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def write_audit_log(self, log_data: Dict[str, Any]) -> None:
         """写入审计日志。"""
+        ...
+
+    # ── Scopes / 统计 ──
+
+    @abc.abstractmethod
+    async def list_scopes(self) -> List[str]:
+        """列出所有出现过数据的 scope。"""
+        ...
+
+    @abc.abstractmethod
+    async def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息。"""
         ...
 
     # ── 启动/关闭 ──

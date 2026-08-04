@@ -52,6 +52,7 @@ class SqliteBackend:
         await self._execute("PRAGMA foreign_keys=ON")
 
         await self._create_schema()
+        await self._migrate()
 
     async def close(self) -> None:
         """关闭数据库连接。"""
@@ -160,10 +161,10 @@ class SqliteBackend:
         await self._execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target)")
         await self._execute("CREATE INDEX IF NOT EXISTS idx_edges_scope ON edges(scope)")
 
-        # Zones 表
+        # Zones 表（复合主键 (scope, name)：zone 归属 scope，跨 scope 允许同名）
         await self._execute("""
             CREATE TABLE IF NOT EXISTS zones (
-                name         TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
                 scope        TEXT NOT NULL,
                 description  TEXT DEFAULT '',
                 entities     TEXT NOT NULL DEFAULT '[]',
@@ -174,7 +175,8 @@ class SqliteBackend:
                 status       TEXT NOT NULL DEFAULT 'active',
                 pinned       INTEGER NOT NULL DEFAULT 0,
                 created_at   REAL NOT NULL,
-                last_access  REAL NOT NULL
+                last_access  REAL NOT NULL,
+                PRIMARY KEY (scope, name)
             )
         """)
         await self._execute(
@@ -210,14 +212,15 @@ class SqliteBackend:
             "CREATE INDEX IF NOT EXISTS idx_keys_agent ON agent_keys(agent_id)"
         )
 
-        # Pair Codes 表
+        # Pair Codes 表（scope_permissions：管理员批准时授予的权限，exchange 时写入 key）
         await self._execute("""
             CREATE TABLE IF NOT EXISTS pair_codes (
                 code        TEXT PRIMARY KEY,
                 agent_id    TEXT NOT NULL,
                 agent_name  TEXT NOT NULL,
                 expires_at  REAL NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'pending'
+                status      TEXT NOT NULL DEFAULT 'pending',
+                scope_permissions TEXT NOT NULL DEFAULT '{}'
             )
         """)
 
@@ -236,6 +239,63 @@ class SqliteBackend:
         await self._execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)"
         )
+
+        await self._commit()
+
+    async def _migrate(self) -> None:
+        """旧库结构迁移（幂等）。
+
+        处理两种情况：
+        1. pair_codes 缺 scope_permissions 列（v2.0 早期 schema）→ ALTER 补列
+        2. zones 表是 name 单主键（v2.0 早期 schema）→ 重建为 (scope, name) 复合主键
+        """
+        # 1. pair_codes.scope_permissions
+        cols = await self._fetchall("PRAGMA table_info(pair_codes)")
+        col_names = [c["name"] for c in cols]
+        if "scope_permissions" not in col_names:
+            await self._execute(
+                "ALTER TABLE pair_codes ADD COLUMN scope_permissions TEXT NOT NULL DEFAULT '{}'"
+            )
+
+        # 2. zones 复合主键检测：name 列 pk=1 且 scope 列 pk=0 → 旧结构
+        zcols = await self._fetchall("PRAGMA table_info(zones)")
+        name_pk = next((c for c in zcols if c["name"] == "name"), None)
+        scope_pk = next((c for c in zcols if c["name"] == "scope"), None)
+        is_old_pk = bool(name_pk and name_pk["pk"] == 1 and (scope_pk is None or scope_pk["pk"] == 0))
+        if is_old_pk:
+            # 重建：改名旧表 → 建新表 → 拷贝数据（同 scope+name 保留 last_access 最新）→ 删旧表
+            await self._execute("ALTER TABLE zones RENAME TO zones_old")
+            await self._execute("""
+                CREATE TABLE zones (
+                    name         TEXT NOT NULL,
+                    scope        TEXT NOT NULL,
+                    description  TEXT DEFAULT '',
+                    entities     TEXT NOT NULL DEFAULT '[]',
+                    keywords     TEXT NOT NULL DEFAULT '[]',
+                    centroid     TEXT,
+                    gravity      REAL NOT NULL DEFAULT 1.0,
+                    entry_count  INTEGER NOT NULL DEFAULT 0,
+                    status       TEXT NOT NULL DEFAULT 'active',
+                    pinned       INTEGER NOT NULL DEFAULT 0,
+                    created_at   REAL NOT NULL,
+                    last_access  REAL NOT NULL,
+                    PRIMARY KEY (scope, name)
+                )
+            """)
+            await self._execute("""
+                INSERT INTO zones (name, scope, description, entities, keywords,
+                                   centroid, gravity, entry_count, status, pinned,
+                                   created_at, last_access)
+                SELECT z.name, z.scope, z.description, z.entities, z.keywords,
+                       z.centroid, z.gravity, z.entry_count, z.status, z.pinned,
+                       z.created_at, z.last_access
+                FROM zones_old z
+                JOIN (
+                    SELECT scope, name, MAX(last_access) AS m
+                    FROM zones_old GROUP BY scope, name
+                ) k ON z.scope = k.scope AND z.name = k.name AND z.last_access = k.m
+            """)
+            await self._execute("DROP TABLE zones_old")
 
         await self._commit()
 
@@ -370,17 +430,29 @@ class SqliteBackend:
             where_clause = " AND e.scope = ?"
             params_scope.append(scope)
 
-        # 使用 FTS5 rank（bm25 近似），e.scope 明确限定
+        # 使用 FTS5 rank（bm25 近似），只返回 active 条目，e.scope 明确限定
+        # 注意：MATCH 必须引用 FTS 表真名（别名对 MATCH 无效）
         sql = f"""
             SELECT e.*, f.rank AS rank
             FROM entries_fts f
             JOIN entries e ON e.id = f.entry_id
-            WHERE entries_fts MATCH ?{where_clause}
+            WHERE entries_fts MATCH ? AND e.status = 'active'{where_clause}
             ORDER BY rank
             LIMIT ?
         """
         params = [query] + params_scope + [top_k]
-        rows = await self._fetchall(sql, tuple(params))
+        try:
+            rows = await self._fetchall(sql, tuple(params))
+        except Exception:  # noqa: BLE001 - FTS5 语法错误（特殊字符）降级 LIKE
+            # FTS5 对特殊字符（" * - AND 等）会抛 malformed MATCH expression，
+            # 降级为子串 LIKE 搜索保证查询不 500
+            like = f"%{query}%"
+            sql2 = f"""
+                SELECT e.* FROM entries e
+                WHERE e.content LIKE ? AND e.status = 'active'{where_clause}
+                ORDER BY e.created_at DESC LIMIT ?
+            """
+            rows = await self._fetchall(sql2, tuple([like] + params_scope + [top_k]))
         results: List[tuple[Entry, float]] = []
         for row in rows:
             d = dict(row)
@@ -515,15 +587,15 @@ class SqliteBackend:
     # ── Zones ──
 
     async def upsert_zone(self, zone: Zone) -> None:
-        """写入/更新 Zone。"""
+        """写入/更新 Zone（复合主键 scope+name）。"""
         data = zone.to_dict()
         await self._execute("""
             INSERT INTO zones (name, scope, description, entities, keywords,
                                centroid, gravity, entry_count, status, pinned,
                                created_at, last_access)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                scope=excluded.scope, description=excluded.description,
+            ON CONFLICT(scope, name) DO UPDATE SET
+                description=excluded.description,
                 entities=excluded.entities, keywords=excluded.keywords,
                 centroid=excluded.centroid, gravity=excluded.gravity,
                 entry_count=excluded.entry_count, status=excluded.status,
@@ -537,9 +609,21 @@ class SqliteBackend:
         ))
         await self._commit()
 
-    async def get_zone(self, name: str) -> Optional[Zone]:
-        """读取单个 Zone。"""
-        row = await self._fetchone("SELECT * FROM zones WHERE name = ?", (name,))
+    async def get_zone(self, name: str, scope: Optional[str] = None) -> Optional[Zone]:
+        """读取单个 Zone。
+
+        Args:
+            name: Zone 名称。
+            scope: 归属 scope（复合主键；None 时按 name 模糊取一条，兼容旧调用）。
+        """
+        if scope is not None:
+            row = await self._fetchone(
+                "SELECT * FROM zones WHERE name = ? AND scope = ?", (name, scope)
+            )
+        else:
+            row = await self._fetchone(
+                "SELECT * FROM zones WHERE name = ? LIMIT 1", (name,)
+            )
         if row is None:
             return None
         return Zone.from_row(dict(row))
@@ -663,7 +747,17 @@ class SqliteBackend:
         return dict(row) if row else None
 
     async def upsert_agent_key(self, key_data: Dict[str, Any]) -> None:
-        """写入密钥。"""
+        """写入密钥。
+
+        兼容两种输入：scope_permissions/zone_overrides 为 dict 或 JSON 字符串
+        （从 DB 读回再写回时是字符串，避免双重编码）。
+        """
+        sp = key_data.get("scope_permissions", {})
+        if isinstance(sp, str):
+            sp = json.loads(sp)
+        zo = key_data.get("zone_overrides", {})
+        if isinstance(zo, str):
+            zo = json.loads(zo)
         await self._execute("""
             INSERT INTO agent_keys (key_id, agent_id, key_hash, scope_permissions,
                                     zone_overrides, rate_limit, expires_at, created_at,
@@ -673,8 +767,8 @@ class SqliteBackend:
                 status=excluded.status, last_used=excluded.last_used
         """, (
             key_data["key_id"], key_data["agent_id"], key_data["key_hash"],
-            json.dumps(key_data.get("scope_permissions", {})),
-            json.dumps(key_data.get("zone_overrides", {})),
+            json.dumps(sp, ensure_ascii=False),
+            json.dumps(zo, ensure_ascii=False),
             key_data.get("rate_limit", 100), key_data.get("expires_at"),
             key_data.get("created_at", time.time()), key_data.get("last_used"),
             key_data.get("status", "active"),
@@ -703,15 +797,20 @@ class SqliteBackend:
         return [dict(r) for r in rows]
 
     async def upsert_pair_code(self, code_data: Dict[str, Any]) -> None:
-        """写入配对码。"""
+        """写入配对码（含批准时授予的 scope 权限）。"""
+        sp = code_data.get("scope_permissions", {})
+        if isinstance(sp, str):
+            sp = json.loads(sp)
         await self._execute("""
-            INSERT INTO pair_codes (code, agent_id, agent_name, expires_at, status)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO pair_codes (code, agent_id, agent_name, expires_at, status, scope_permissions)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
-                status=excluded.status, expires_at=excluded.expires_at
+                status=excluded.status, expires_at=excluded.expires_at,
+                scope_permissions=excluded.scope_permissions
         """, (
             code_data["code"], code_data["agent_id"], code_data["agent_name"],
-            code_data["expires_at"], code_data.get("status", "pending")
+            code_data["expires_at"], code_data.get("status", "pending"),
+            json.dumps(sp, ensure_ascii=False),
         ))
         await self._commit()
 
@@ -748,10 +847,24 @@ class SqliteBackend:
         zones = await self._fetchone("SELECT COUNT(*) as cnt FROM zones")
         facts = await self._fetchone("SELECT COUNT(*) as cnt FROM facts")
         edges = await self._fetchone("SELECT COUNT(*) as cnt FROM edges")
+        try:
+            db_size = os.path.getsize(self._db_path)
+        except OSError:
+            db_size = 0
         return {
             "total_entries": total["cnt"] if total else 0,
             "active_entries": active["cnt"] if active else 0,
-            "zones": zones["cnt"] if zones else 0,
-            "facts": facts["cnt"] if facts else 0,
-            "edges": edges["cnt"] if edges else 0,
+            "total_zones": zones["cnt"] if zones else 0,
+            "total_facts": facts["cnt"] if facts else 0,
+            "total_edges": edges["cnt"] if edges else 0,
+            "db_size_bytes": db_size,
         }
+
+    # ── Scopes ──
+
+    async def list_scopes(self) -> List[str]:
+        """列出所有出现过数据的 scope（entries + zones 并集）。"""
+        rows = await self._fetchall(
+            "SELECT DISTINCT scope FROM entries UNION SELECT DISTINCT scope FROM zones"
+        )
+        return [r["scope"] for r in rows]

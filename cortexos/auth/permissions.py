@@ -51,18 +51,16 @@ def check_permission(
     # ① Zone 覆盖
     zone_override = key.get_zone_override(scope, zone)
     if zone_override is not None:
-        # 单调递减约束：zone 覆盖 rank ≤ scope rank
+        # 单调递减约束：zone 覆盖 rank ≤ scope rank（不能越权）
         scope_perm = key.scope_permissions.get(scope)
         scope_rank = _rank(scope_perm) if scope_perm else 0
         override_rank = _rank(zone_override)
         # zone 覆盖只允许 ≤ scope rank
         if override_rank > scope_rank:
             return False
-        # zone 覆盖只允许 read（收紧），不允许 write 越权
-        if action == "write" and zone_override != "readwrite":
-            return False  # zone 覆盖不支持 write
-        if action == "write" and zone_override == "readwrite":
-            return True
+        # zone 覆盖默认收紧为只读；readwrite 覆盖（且 scope 允许）才放行写
+        if action == "write":
+            return zone_override == "readwrite"
         return _rank(zone_override) >= _rank(action)
 
     # ② Scope 权限

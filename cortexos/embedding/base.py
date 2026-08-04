@@ -12,10 +12,17 @@ class Embedder(abc.ABC):
     所有 embedding 实现（OpenAI 兼容 / TF-IDF 降级）必须实现此接口。
     """
 
-    # 相似度尺度提示：不同向量化方式的余弦相似度分布不同。
-    # 语义 embedding（如 OpenAI text-embedding）相似度普遍偏高，
-    # 稀疏 TF-IDF 向量相似度普遍偏低。聚类/路由阈值应据此适配。
-    similarity_scale: float = 0.75  # 默认按语义 embedding 尺度
+    @property
+    def is_available(self) -> bool:
+        """Embedder 是否可用（提供语义向量能力）。
+
+        对仅支持本地计算的实现（如 TF-IDF），返回 True 表示
+        向量化本身可用但无 LLM 能力；对 OpenAI，返回 True
+        仅当配置了 API key。
+
+        LLM 提取需额外检查（见 extract_entities 的 guard）。
+        """
+        return True
 
     @abc.abstractmethod
     async def embed(self, texts: List[str]) -> List[List[float]]:
