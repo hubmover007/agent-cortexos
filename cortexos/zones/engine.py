@@ -52,6 +52,13 @@ async def emergence_scan(
     """
     new_zones: List[Zone] = []
 
+    # 阈值适配：不同 embedder 的相似度尺度不同
+    # （语义 embedding scale=0.75，稀疏 TF-IDF scale=0.3）
+    # 以 0.75 为基准做线性缩放，保证各 embedder 下涌现行为一致
+    scale_factor = embedder.similarity_scale / 0.75
+    semantic_threshold = config.zone.emergence.semantic_threshold * scale_factor
+    cluster_sim = config.zone.emergence.cluster_similarity * scale_factor
+
     # Step 1: 质量门
     candidates = [
         e for e in inbox_entries
@@ -65,7 +72,7 @@ async def emergence_scan(
     remaining: List[Entry] = []
     for e in candidates:
         matched = route_semantic_only(
-            e, zones, embedder, config.zone.emergence.semantic_threshold
+            e, zones, embedder, semantic_threshold
         )
         if matched:
             # 更新 zone 质心（增量滚动更新）
@@ -80,7 +87,7 @@ async def emergence_scan(
     # Step 3: 剩余条目连通聚类
     clusters = cluster_entries(
         remaining,
-        similarity_threshold=config.zone.emergence.cluster_similarity,
+        similarity_threshold=cluster_sim,
         embedder=embedder,
     )
 

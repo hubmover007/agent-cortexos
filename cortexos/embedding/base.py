@@ -12,6 +12,11 @@ class Embedder(abc.ABC):
     所有 embedding 实现（OpenAI 兼容 / TF-IDF 降级）必须实现此接口。
     """
 
+    # 相似度尺度提示：不同向量化方式的余弦相似度分布不同。
+    # 语义 embedding（如 OpenAI text-embedding）相似度普遍偏高，
+    # 稀疏 TF-IDF 向量相似度普遍偏低。聚类/路由阈值应据此适配。
+    similarity_scale: float = 0.75  # 默认按语义 embedding 尺度
+
     @abc.abstractmethod
     async def embed(self, texts: List[str]) -> List[List[float]]:
         """对文本列表生成 embedding 向量。

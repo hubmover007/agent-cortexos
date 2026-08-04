@@ -26,7 +26,12 @@ class TfidfEmbedder(Embedder):
     4. 通过特征哈希（feature hashing）映射到固定维度
 
     复杂度：O(n × max_features)，适合 <10 万条目场景。
+
+    注意：稀疏 TF-IDF 向量的余弦相似度分布与语义 embedding 不同
+    （普遍偏低），因此 similarity_scale 设为 0.3，供聚类/路由阈值适配。
     """
+
+    similarity_scale: float = 0.3
 
     def __init__(self, max_features: int = 512):
         """初始化 TF-IDF Embedder。
@@ -76,10 +81,13 @@ class TfidfEmbedder(Embedder):
     def _hash_feature(self, token: str) -> int:
         """将 token 哈希到 [0, max_features) 范围。
 
-        使用 Python 内置 hash + 取模。
+        使用 hashlib md5（确定性）而非 Python 内置 hash()，
+        因为内置 hash() 受 PYTHONHASHSEED 随机化影响，
+        会导致同一文本在不同进程产生不同向量（不可接受）。
         """
-        h = hash(token) % self._max_features
-        return h if h >= 0 else h + self._max_features
+        import hashlib
+        digest = hashlib.md5(token.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") % self._max_features
 
     # ── 向量化 ──
 

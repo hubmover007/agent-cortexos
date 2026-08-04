@@ -271,21 +271,33 @@ class SqliteBackend:
         )
         await self._commit()
 
-    async def get_entry(self, entry_id: str) -> Optional[Entry]:
-        """读取单条条目。"""
+    async def get_entry(self, entry_id: str, active_only: bool = False) -> Optional[Entry]:
+        """读取单条条目。
+
+        Args:
+            entry_id: 条目 ID。
+            active_only: 如果 True，只返回 status='active' 的条目。
+        """
         row = await self._fetchone("SELECT * FROM entries WHERE id = ?", (entry_id,))
         if row is None:
             return None
-        return Entry.from_row(dict(row))
+        entry = Entry.from_row(dict(row))
+        if active_only and entry.status != "active":
+            return None
+        return entry
 
-    async def delete_entry(self, entry_id: str) -> None:
-        """软删除条目（status → archived）。"""
+    async def delete_entry(self, entry_id: str) -> bool:
+        """软删除条目（status → archived），返回是否删除成功。"""
+        entry = await self.get_entry(entry_id)
+        if not entry:
+            return False
         now = time.time()
         await self._execute(
             "UPDATE entries SET status='archived', updated_at=? WHERE id=?",
             (now, entry_id)
         )
         await self._commit()
+        return True
 
     async def list_entries(
         self,
@@ -590,6 +602,38 @@ class SqliteBackend:
             for row in rows:
                 yield Entry.from_row(dict(row))
             offset += 100
+
+    async def scan_zone(
+        self,
+        *,
+        scope: str = None,
+        zone: str = None,
+        limit: int = 50,
+    ) -> List[Entry]:
+        """扫描 zone 内条目。
+
+        Args:
+            scope: scope。
+            zone: zone 名称（None 表示所有 zone）。
+            limit: 返回条数上限。
+
+        Returns:
+            条目列表。
+        """
+        conditions = ["status = 'active'"]
+        params: List[Any] = []
+        if scope:
+            conditions.append("scope = ?")
+            params.append(scope)
+        if zone:
+            conditions.append("zone = ?")
+            params.append(zone)
+        where = " AND ".join(conditions)
+        rows = await self._fetchall(
+            f"SELECT * FROM entries WHERE {where} ORDER BY created_at DESC LIMIT ?",
+            params + [limit],
+        )
+        return [Entry.from_row(dict(r)) for r in rows]
 
     async def bulk_update_status(self, updates: List[tuple[str, str]]) -> None:
         """批量更新条目状态 [(entry_id, new_status), ...]"""

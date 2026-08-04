@@ -293,3 +293,33 @@ def _to_dict_recursive(obj: Any) -> Any:
 def load_config(path: Optional[str] = None) -> Config:
     """便捷函数：加载配置。"""
     return Config.load(config_path=path)
+
+
+def _make_embedder(config: Config):
+    """根据配置创建嵌入器（API 可用时用 API，否则用 TF-IDF）。
+
+    Args:
+        config: 配置对象。
+
+    Returns:
+        Embedder 实例。
+    """
+    import os
+    from cortexos.embedding.openai_compat import OpenAICompatEmbedder
+    api_key = os.environ.get(config.llm.api_key_env)
+    base_url = config.llm.base_url or os.environ.get("OPENAI_BASE_URL")
+    if api_key and base_url:
+        return OpenAICompatEmbedder(
+            base_url=base_url,
+            api_key=api_key,
+            api_key_env=config.llm.api_key_env,
+            model=config.llm.embedding_model or "text-embedding-3-small",
+            chat_model=config.llm.model or "gpt-4o-mini",
+        )
+    from cortexos.embedding.tfidf import TfidfEmbedder
+    return TfidfEmbedder()
+
+
+def _get_or_create_embedder(config: Config):
+    """CLI 兼容别名。"""
+    return _make_embedder(config)

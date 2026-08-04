@@ -308,14 +308,16 @@ class TestEmergence:
                 zone="_inbox",
                 embedding=None,
             ))
-        # Embed
-        texts = [e.content for e in entries]
-        vecs = await emb.embed(texts)
-        for e, v in zip(entries, vecs):
-            e.embedding = v
+        # 用 one-hot 正交向量（两两相似度恒为 0，确定性，绝不涌现）
+        for idx, e in enumerate(entries):
+            v = [0.0] * 64
+            # 每个条目独占两个维度，保证与其他条目正交
+            v[idx * 2 % 64] = 1.0
+            v[(idx * 2 + 1) % 64] = 1.0
+            norm = (2.0) ** 0.5
+            e.embedding = [x / norm for x in v]
         new_zones = await emergence_scan(entries, [], emb, cfg, total_entries=100)
-        # 每条文本不同，TF-IDF 小维度(16) + hash 碰撞可能导致一些连边
-        # 但不应涌现（每条 < 5）
+        # 49 条互不相似的条目，不应涌现（每条 < 5）
         assert len(new_zones) == 0
 
     @pytest.mark.asyncio
@@ -353,7 +355,7 @@ class TestEmergence:
         entries = []
         for i in range(20):
             entries.append(self.make_entry(
-                f"k8s restart case number {i}",
+                "k8s pod restart incident analysis",  # 相同语义文本，确保相似度接近 1
                 [],
                 ["k8s", "restart"],
             ))
