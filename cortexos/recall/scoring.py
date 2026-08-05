@@ -41,17 +41,28 @@ def rrf_fusion(
     return scores
 
 
-def compute_text_sim(entry_id: str, rrf_scores: Dict[str, float]) -> float:
-    """从 RRF 融合分中获取文本相似度。
+def compute_text_sim(
+    entry_id: str,
+    semantic_scores: Dict[str, float],
+    lexical_scores: Dict[str, float],
+) -> float:
+    """计算文本相似度：取语义余弦与词法 bm25 归一化分数的较大值。
+
+    不再使用 RRF 排名分（排名只反映相对顺序，丢失相似度强度，
+    会导致不相关条目也拿到接近满分）。
 
     Args:
         entry_id: 条目 ID。
-        rrf_scores: RRF 融合分映射。
+        semantic_scores: 语义通道余弦相似度映射。
+        lexical_scores: 词法通道归一化 bm25 分数映射。
 
     Returns:
         text_sim (0~1)。
     """
-    return rrf_scores.get(entry_id, 0.0)
+    return max(
+        semantic_scores.get(entry_id, 0.0),
+        lexical_scores.get(entry_id, 0.0),
+    )
 
 
 def compute_recency(created_at: float, half_life_days: float = 7.0) -> float:
@@ -93,6 +104,8 @@ def score_entry(
     zone_gravity: float = 1.0,
     weights: Optional[RecallWeights] = None,
     half_life_days: float = 7.0,
+    semantic_scores: Optional[Dict[str, float]] = None,
+    lexical_scores: Optional[Dict[str, float]] = None,
 ) -> float:
     """多因子评分。
 
@@ -102,12 +115,14 @@ def score_entry(
 
     Args:
         entry: 条目。
-        rrf_scores: RRF 融合文本相似度。
+        rrf_scores: RRF 融合分（保留用于兼容/调试）。
         graph_scores: 图遍历得分。
         query_scope: 查询 scope。
         zone_gravity: Zone 重力值。
         weights: 权重配置。
         half_life_days: 半衰期天数。
+        semantic_scores: 语义通道真实余弦相似度。
+        lexical_scores: 词法通道归一化分数。
 
     Returns:
         综合得分。
@@ -115,7 +130,11 @@ def score_entry(
     if weights is None:
         weights = RecallWeights()
 
-    text_sim = rrf_scores.get(entry.id, 0.0)
+    text_sim = compute_text_sim(
+        entry.id,
+        semantic_scores or {},
+        lexical_scores or {},
+    )
     recency = compute_recency(entry.created_at, half_life_days)
     gravity = zone_gravity
     freq = compute_freq(entry.access_count)
@@ -142,6 +161,8 @@ def rank_entries(
     weights: Optional[RecallWeights] = None,
     half_life_days: float = 7.0,
     top_k: int = 20,
+    semantic_scores: Optional[Dict[str, float]] = None,
+    lexical_scores: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[Entry, float]]:
     """多因子排序：对条目列表评分并排序。
 
@@ -154,6 +175,8 @@ def rank_entries(
         weights: 权重。
         half_life_days: 半衰期。
         top_k: 返回前 k 条。
+        semantic_scores: 语义通道真实余弦相似度。
+        lexical_scores: 词法通道归一化分数。
 
     Returns:
         排序后的 [(entry, score)] 列表。
@@ -164,6 +187,7 @@ def rank_entries(
         s = score_entry(
             entry, rrf_scores, graph_scores, query_scope,
             zone_gravity, weights, half_life_days,
+            semantic_scores, lexical_scores,
         )
         scored.append((entry, s))
 

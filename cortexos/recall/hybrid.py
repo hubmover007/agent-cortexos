@@ -61,23 +61,28 @@ async def hybrid_retrieve(
 
     # ── 通道 1: 语义向量 ──
     ranked_semantic: List[str] = []
+    semantic_scores: Dict[str, float] = {}
     try:
         query_vec = await embedder.embed_query(query)
         all_embs = await backend.search_all_embeddings(scope=scope)
-        # 内存余弦相似度排序
+        # 内存余弦相似度排序，低于阈值（语义不相关）不进候选
         scored: List[Tuple[str, float]] = []
         for eid, emb in all_embs:
             if emb:
                 sim = embedder.cosine_similarity(query_vec, emb)
-                scored.append((eid, sim))
+                if sim >= config.recall.semantic_min_similarity:
+                    scored.append((eid, sim))
         scored.sort(key=lambda x: x[1], reverse=True)
         ranked_semantic = [eid for eid, _ in scored[:top_k * 3]]
+        semantic_scores = dict(scored)
     except Exception:
         ranked_semantic = []
+        semantic_scores = {}
 
     # ── 通道 2: 词法 FTS5 ──
     lexical_results = await backend.search_lexical(query, scope=scope, top_k=top_k * 3)
     ranked_lexical = [r[0].id for r in lexical_results]
+    lexical_scores = {r[0].id: r[1] for r in lexical_results}
 
     # ── 通道 3: 实体精确 ──
     ranked_entity: List[str] = []
@@ -125,7 +130,7 @@ async def hybrid_retrieve(
         for z in zones:
             zone_gravities[z.name] = z.gravity
 
-    # ── 多因子评分排序 ──
+    # ── 多因子评分排序（text_sim 用真实相似度，不用 RRF 排名分）──
     results = rank_entries(
         candidates,
         rrf_scores,
@@ -135,6 +140,8 @@ async def hybrid_retrieve(
         weights=config.recall.weights,
         half_life_days=half_life,
         top_k=top_k,
+        semantic_scores=semantic_scores,
+        lexical_scores=lexical_scores,
     )
 
     return results

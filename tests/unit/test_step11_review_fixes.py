@@ -543,3 +543,86 @@ class TestLexicalFallback:
             await db.close()
         finally:
             os.unlink(path)
+
+
+@pytest.mark.asyncio
+class TestRecallScoreDiscrimination:
+    """检索评分区分度回归（text_sim 用真实相似度，无匹配返回空）。"""
+
+    async def test_relevant_query_ranks_above_noise(self):
+        """回归：相关条目的分必须显著高于不相关条目（真实余弦相似度）。"""
+        from cortexos.storage.sqlite_backend import SqliteBackend
+        from cortexos.embedding.tfidf import TfidfEmbedder
+        from cortexos.recall.hybrid import hybrid_retrieve
+        from cortexos.recall.graph import GraphIndex
+        path = _temp_db()
+        try:
+            db = SqliteBackend(path)
+            await db.initialize()
+            embedder = TfidfEmbedder()
+            cfg = Config()
+
+            from cortexos.models import Entry
+            e1 = Entry(content="EasyClaw 监控平台地址是 43.106.7.176", scope="agent:r")
+            e2 = Entry(content="今天天气很好适合出去散步", scope="agent:r")
+            await db.upsert_entry(e1)
+            await db.upsert_entry(e2)
+            # 手动写 embedding（TF-IDF 单文档向量，用 embed_query 生成一维向量）
+            v1 = await embedder.embed_query(e1.content)
+            v2 = await embedder.embed_query(e2.content)
+            await db._execute(
+                "UPDATE entries SET embedding=? WHERE id=?",
+                (json.dumps(v1), e1.id),
+            )
+            await db._execute(
+                "UPDATE entries SET embedding=? WHERE id=?",
+                (json.dumps(v2), e2.id),
+            )
+            await db._commit()
+
+            gi = GraphIndex()
+            results = await hybrid_retrieve(
+                "EasyClaw 监控平台地址", embedder, db, gi, cfg,
+                scope="agent:r", top_k=5,
+            )
+            ids = [e.id for e, _ in results]
+            assert e1.id in ids, "相关条目必须被召回"
+            score_e1 = next(s for e, s in results if e.id == e1.id)
+            score_e2 = next((s for e, s in results if e.id == e2.id), 0.0)
+            # 相关条目分数显著高于噪声条目（真实余弦差异，而非 RRF 排名微差）
+            assert score_e1 > score_e2 + 0.05, f"区分度不足: {score_e1} vs {score_e2}"
+            await db.close()
+        finally:
+            os.unlink(path)
+
+    async def test_irrelevant_query_returns_empty(self):
+        """回归：无任何相关内容时返回空列表（语义阈值过滤）。"""
+        from cortexos.storage.sqlite_backend import SqliteBackend
+        from cortexos.embedding.tfidf import TfidfEmbedder
+        from cortexos.recall.hybrid import hybrid_retrieve
+        from cortexos.recall.graph import GraphIndex
+        from cortexos.models import Entry
+        path = _temp_db()
+        try:
+            db = SqliteBackend(path)
+            await db.initialize()
+            embedder = TfidfEmbedder()
+            cfg = Config()
+            e1 = Entry(content="EasyClaw 监控平台地址是 43.106.7.176", scope="agent:r2")
+            await db.upsert_entry(e1)
+            v1 = await embedder.embed(e1.content)
+            await db._execute(
+                "UPDATE entries SET embedding=? WHERE id=?",
+                (json.dumps(v1), e1.id),
+            )
+            await db._commit()
+
+            gi = GraphIndex()
+            results = await hybrid_retrieve(
+                "xyzzy 完全不相关的内容", embedder, db, gi, cfg,
+                scope="agent:r2", top_k=5,
+            )
+            assert results == [], f"无匹配查询应返回空，实际 {len(results)} 条"
+            await db.close()
+        finally:
+            os.unlink(path)

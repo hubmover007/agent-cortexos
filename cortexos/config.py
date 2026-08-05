@@ -202,6 +202,9 @@ class RecallConfig:
     graph_hop: int = 2
     graph_decay: float = 0.5
     top_k: int = 20
+    # 语义通道候选过滤阈值：余弦相似度低于此值的条目不参与召回
+    # （TF-IDF 稀疏向量余弦天然偏低，0.1 可区分相关/噪声）
+    semantic_min_similarity: float = 0.1
 
 
 @dataclass
