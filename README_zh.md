@@ -85,3 +85,65 @@ score = 0.4 × 文本相似度 + 0.3 × 时效性 + 0.2 × Zone引力 + 0.1 × �
 ## 许可证
 
 MIT — 详见 [LICENSE](LICENSE)。
+
+## 远程接入（多 Agent 部署）
+
+CortexOS 设计为多 Agent 共享记忆服务：一个服务端，多台主机上的 Agent 各自接入、权限隔离。
+
+### 部署服务端
+
+```bash
+# 方式一：本地 CLI 确认配对（最简单，推荐单机场景）
+cortexos serve --host 0.0.0.0 --port 8200 --db memory.db
+
+# 方式二：远程确认配对（多机场景，必须配置管理令牌）
+export CORTEXOS_SERVER_ADMIN_TOKEN='your-secret-admin-token'
+cortexos serve --host 0.0.0.0 --port 8200 --db memory.db
+```
+
+⚠️ **安全要求**：
+- 生产环境必须配置 `CORTEXOS_SERVER_ADMIN_TOKEN`。未配置时 API 的配对确认
+  （`POST /v1/pair/confirm`）一律返回 403，只能通过服务端本地
+  `cortexos pair-approve` 确认——防止任何人自批自领密钥。
+- 建议在防火墙/安全组只放行可信主机 IP，生产环境前置 TLS 反向代理。
+
+### Agent 侧接入（任意主机）
+
+```python
+from cortexos import CortexOS
+
+# 1. 发起配对（agent 侧）
+import aiohttp, asyncio
+
+async def pair(base_url: str, agent_name: str, admin_token: str, scopes: dict):
+    async with aiohttp.ClientSession() as s:
+        # ① 发起配对请求 → 拿一次性配对码
+        async with s.post(f"{base_url}/pair/request",
+                          json={"agent_name": agent_name}) as r:
+            code = (await r.json())["code"]
+
+        # ② 管理员确认（需 X-Admin-Token）
+        async with s.post(f"{base_url}/pair/confirm",
+                          json={"code": code, "scope_permissions": scopes},
+                          headers={"X-Admin-Token": admin_token}) as r:
+            assert r.status == 200
+
+        # ③ 兑换密钥（secret 仅此一次可见，请妥善保存）
+        async with s.post(f"{base_url}/pair/exchange",
+                          json={"code": code}) as r:
+            secret = (await r.json())["secret"]
+    return secret
+
+secret = asyncio.run(pair("http://cortexos-host:8200/v1",
+                          "agent-bot-b", "your-secret-admin-token",
+                          {"agent:bot-b": "readwrite"}))
+
+# 2. 正常使用（Bearer 认证，scope 权限隔离）
+cx = CortexOS(base_url="http://cortexos-host:8200/v1", api_key=secret)
+await cx.store("今天部署了 nginx", scope="agent:bot-b")
+results = await cx.recall("nginx", scope="agent:bot-b")
+```
+
+每个 Agent 用独立配对码 + 独立 scope（如 `agent:bot-a` / `agent:bot-b`），
+权限互不可见；管理端通过 `cortexos pair-approve --scopes '{"agent:bot-b":"read"}'
+` 精确控制每个 Agent 能读写哪些 scope。

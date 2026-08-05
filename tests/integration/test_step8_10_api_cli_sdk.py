@@ -39,6 +39,7 @@ def app_client():
     db = asyncio.run(init())
 
     config = Config()
+    config.server.admin_token = "test-admin-token"
     app = create_app_v1(db, config)
     client = TestClient(app)
 
@@ -65,7 +66,7 @@ def _pair(client, agent_name: str, scopes: dict) -> dict:
     r2 = client.post("/v1/pair/confirm", json={
         "code": code,
         "scope_permissions": scopes,
-    })
+    }, headers={"X-Admin-Token": "test-admin-token"})
     assert r2.status_code == 200
 
     r3 = client.post("/v1/pair/exchange", json={"code": code})
@@ -114,7 +115,7 @@ class TestPairingAPI:
         r2 = client.post("/v1/pair/confirm", json={
             "code": code,
             "scope_permissions": {"agent:bot1": "readwrite"},
-        })
+        }, headers={"X-Admin-Token": "test-admin-token"})
         assert r2.status_code == 200
         assert r2.json()["code"] == code
 
@@ -126,7 +127,7 @@ class TestPairingAPI:
         r2 = client.post("/v1/pair/confirm", json={
             "code": code,
             "scope_permissions": {"agent:bot2": "readwrite"},
-        })
+        }, headers={"X-Admin-Token": "test-admin-token"})
         assert r2.status_code == 200
 
         r3 = client.post("/v1/pair/exchange", json={"code": code})
@@ -152,7 +153,7 @@ class TestPairingAPI:
         resp = client.post("/v1/pair/confirm", json={
             "code": "INVALID",
             "scope_permissions": {},
-        })
+        }, headers={"X-Admin-Token": "test-admin-token"})
         assert resp.status_code == 400
 
     def test_pair_double_exchange_rejected(self, app_client):
@@ -164,7 +165,7 @@ class TestPairingAPI:
         client.post("/v1/pair/confirm", json={
             "code": code,
             "scope_permissions": {"agent:bot3": "readwrite"},
-        })
+        }, headers={"X-Admin-Token": "test-admin-token"})
         client.post("/v1/pair/exchange", json={"code": code})
 
         # 第二次
@@ -838,3 +839,59 @@ class TestLocalDeployConfigChain:
         )
         assert r.returncode == 0
         assert "--config" in r.stdout
+
+
+class TestPairAdminToken:
+    """pair/confirm 管理令牌加固回归。"""
+
+    def test_confirm_requires_admin_token(self, app_client):
+        """回归：无 X-Admin-Token → 403。"""
+        client, db, path = app_client
+        r1 = client.post("/v1/pair/request", json={"agent_name": "hacker"})
+        code = r1.json()["code"]
+        resp = client.post("/v1/pair/confirm", json={
+            "code": code,
+            "scope_permissions": {"agent:hacker": "readwrite"},
+        })
+        assert resp.status_code == 403
+
+    def test_confirm_wrong_admin_token(self, app_client):
+        """回归：错误 X-Admin-Token → 403。"""
+        client, db, path = app_client
+        r1 = client.post("/v1/pair/request", json={"agent_name": "hacker2"})
+        code = r1.json()["code"]
+        resp = client.post("/v1/pair/confirm", json={
+            "code": code,
+            "scope_permissions": {"agent:hacker2": "readwrite"},
+        }, headers={"X-Admin-Token": "wrong-token"})
+        assert resp.status_code == 403
+
+    def test_confirm_disabled_without_server_token(self):
+        """回归：服务端未配置 admin_token 时 API confirm 一律 403。"""
+        import asyncio
+        from fastapi.testclient import TestClient
+        from cortexos.api.routes import create_app_v1
+        from cortexos.config import Config
+        from cortexos.storage.sqlite_backend import SqliteBackend
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            async def init():
+                db = SqliteBackend(path)
+                await db.initialize()
+                return db
+            db = asyncio.run(init())
+            config = Config()  # admin_token 为空（默认）
+            client = TestClient(create_app_v1(db, config))
+
+            r1 = client.post("/v1/pair/request", json={"agent_name": "noconf"})
+            code = r1.json()["code"]
+            resp = client.post("/v1/pair/confirm", json={
+                "code": code,
+                "scope_permissions": {"agent:noconf": "read"},
+            }, headers={"X-Admin-Token": "anything"})
+            assert resp.status_code == 403
+            client.close()
+        finally:
+            os.unlink(path)

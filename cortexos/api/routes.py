@@ -152,10 +152,26 @@ async def pair_request(
 
 async def pair_confirm(
     req: PairConfirmReq,
+    request: Request,
     backend=Depends(get_backend),
     config=Depends(get_config),
 ):
-    """管理员确认配对。"""
+    """管理员确认配对（需 X-Admin-Token 管理令牌）。
+
+    - 服务端未配置 admin_token 时，API 确认一律拒绝（403），
+      只能通过服务端本地 CLI `cortexos pair-approve` 确认。
+    - 远程场景必须配置 CORTEXOS_SERVER_ADMIN_TOKEN 并携带该令牌。
+    """
+    admin_token = (config.server.admin_token or "").strip()
+    if not admin_token:
+        raise HTTPException(
+            403, "API pairing confirm disabled: 请配置 CORTEXOS_SERVER_ADMIN_TOKEN "
+                 "或使用服务端本地 CLI cortexos pair-approve"
+        )
+    provided = request.headers.get("X-Admin-Token", "")
+    if provided != admin_token:
+        raise HTTPException(403, "Invalid admin token")
+
     from cortexos.auth.pairing import pair_approve
     result = await pair_approve(
         req.code, req.scope_permissions,

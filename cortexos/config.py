@@ -110,6 +110,10 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8200
     tls: bool = False
+    # 管理令牌：pair/confirm 远程确认必须携带 X-Admin-Token 头。
+    # 为空时 API confirm 一律拒绝（只能通过服务端本地 CLI pair-approve 确认）。
+    # 可用环境变量 CORTEXOS_SERVER_ADMIN_TOKEN 注入。
+    admin_token: str = ""
 
 
 @dataclass
